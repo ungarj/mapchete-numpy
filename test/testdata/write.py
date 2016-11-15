@@ -1,0 +1,21 @@
+#!/usr/bin/env python
+
+from mapchete import MapcheteProcess
+import numpy as np
+
+class Process(MapcheteProcess):
+    """Main process class"""
+    def __init__(self, **kwargs):
+        """Process initialization"""
+        # init process
+        MapcheteProcess.__init__(self, **kwargs)
+        self.identifier = "my_process_id",
+        self.title="My long process title",
+        self.version = "0.1",
+        self.abstract="short description on what my process does"
+
+    def execute(self):
+        with self.open("file1") as test_file:
+            data = test_file.read()
+            expanded_data = data[np.newaxis, np.newaxis, :]
+        return expanded_data

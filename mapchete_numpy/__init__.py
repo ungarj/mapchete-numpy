@@ -3,9 +3,11 @@
 import os
 import numpy as np
 import numpy.ma as ma
+import bloscpack as bp
 
 from mapchete.formats import base
 from mapchete.tile import BufferedTile
+from mapchete.io import raster
 
 
 class OutputData(base.OutputData):
@@ -32,7 +34,31 @@ class OutputData(base.OutputData):
 
     def write(self, process_tile, overwrite=False):
         """Write process output into GeoTIFFs."""
-        raise NotImplementedError()
+        process_tile.data = process_tile.data[:]
+        self.verify_data(process_tile.data)
+        self.prepare_data(process_tile.data)
+        assert isinstance(process_tile.data, ma.MaskedArray)
+        # Convert from process_tile to output_tiles
+        for tile in self.pyramid.intersecting(process_tile):
+            # skip if file exists and overwrite is not set
+            out_path = self.get_path(tile)
+            if os.path.exists(out_path) and not overwrite:
+                return
+            out_tile = BufferedTile(tile, self.pixelbuffer)
+            out_data = raster.extract_from_tile(process_tile, out_tile)
+            # write_from_tile(buffered_tile, profile, out_tile, out_path)
+            stack = self.add_to_stack(out_data, out_tile)
+            if isinstance(stack.mask, np.bool_):
+                if stack.mask is False:
+                    self.prepare_path(tile)
+                    bp.pack_ndarray_file(np.array([
+                        stack,
+                        np.full(process_tile.data.shape, stack.mask, bool)]),
+                        out_path)
+            elif not stack.mask.all():
+                self.prepare_path(tile)
+                bp.pack_ndarray_file(
+                    np.array([stack, stack.mask]), out_path)
 
     def tiles_exist(self, process_tile):
         """Check whether all output tiles of a process tile exist."""
@@ -50,6 +76,8 @@ class OutputData(base.OutputData):
         assert isinstance(config["path"], str)
         assert "dtype" in config
         assert isinstance(config["dtype"], str)
+        assert "ndim" in config
+        assert isinstance(config["ndim"], int)
         return True
 
     def get_path(self, tile):
@@ -67,89 +95,107 @@ class OutputData(base.OutputData):
         if not os.path.exists(rowdir):
             os.makedirs(rowdir)
 
-    def profile(self, tile):
-        """Create a metadata dictionary for rasterio."""
-        dst_metadata = GTIFF_PROFILE
-        dst_metadata.pop("transform", None)
-        dst_metadata.update(
-            crs=tile.crs, width=tile.width, height=tile.height,
-            affine=tile.affine, driver="GTiff",
-            count=self.output_params["bands"],
-            dtype=self.output_params["dtype"]
-        )
-        return dst_metadata
-
     def verify_data(self, tile):
         """Verify array data and move array into tuple if necessary."""
         try:
-            assert isinstance(
-                tile.data, (np.ndarray, ma.MaskedArray, tuple, list))
+            assert isinstance(tile.data, (np.ndarray, ma.MaskedArray))
         except AssertionError:
             raise ValueError(
-                "process output must be 2D NumPy array, masked array or a tuple"
+                "process output must be a NumPy ndarray or MaskedArray."
                 )
         try:
-            if isinstance(tile.data, (tuple, list)):
-                for band in tile.data:
-                    assert band.ndim == 2
-            else:
-                assert tile.data.ndim in [2, 3]
-        except AssertionError:
+            target_dim = self.output_params["ndim"]
+            assert tile.data.ndim in [target_dim, target_dim-1]
+        except:
             raise ValueError(
-                "each output band must be a 2D NumPy array")
+                "process output must have %s dimensions" %
+                self.output_params["ndim"]
+            )
 
-
-    def prepare_data(self, data, profile):
+    def prepare_data(self, data):
         """
         Convert data into correct output.
 
-        Returns a 3D masked NumPy array including all bands with the data type
+        Returns a nD masked NumPy array including all bands with the data type
         specified in the configuration.
         """
-        if isinstance(data, (list, tuple)):
-            out_data = ()
-            out_mask = ()
-            for band in data:
-                if isinstance(band, ma.MaskedArray):
-                    try:
-                        assert band.shape == band.mask.shape
-                        out_data += (band, )
-                        out_mask += (band.mask, )
-                    except:
-                        out_data += (band.data, )
-                        out_mask += (
-                            np.where(band.data == self.nodata, True, False), )
-                elif isinstance(band, np.ndarray):
-                    out_data += (band)
-                    out_mask += (np.where(band == self.nodata, True, False))
-                else:
-                    raise ValueError("input data bands must be NumPy arrays")
-            assert len(out_data) == len(out_mask)
+        if isinstance(data, np.ndarray):
             return ma.MaskedArray(
-                data=np.stack(out_data).astype(profile["dtype"]),
-                mask=np.stack(out_mask))
-        elif isinstance(data, np.ndarray) and data.ndim == 2:
-            data = ma.expand_dims(data, axis=0)
-        if isinstance(data, ma.MaskedArray):
-            try:
-                assert data.shape == data.mask.shape
-                return data.astype(profile["dtype"])
-            except:
-                return ma.MaskedArray(
-                    data=data.astype(profile["dtype"]),
-                    mask=np.where(band.data == self.nodata, True, False))
-        elif isinstance(data, np.ndarray):
-            return ma.MaskedArray(
-                data=data.astype(profile["dtype"]),
+                data=data.astype(self.output_params["dtype"]),
                 mask=np.where(data == self.nodata, True, False))
+        else:
+            return data
 
 
     def empty(self, process_tile):
         """Empty data."""
-        profile = self.profile(process_tile)
         return ma.masked_array(
-            data=np.full(
-                (profile["count"], ) + process_tile.shape, profile["nodata"],
-                dtype=profile["dtype"]),
+            data=np.array(
+                np.full(
+                    (self.output_params["bands"], ) + process_tile.shape,
+                    self.output_params["nodata"],
+                    dtype=self.output_params["dtype"]),
+                ndmin=self.output_params["ndim"]
+            ),
             mask=True
         )
+
+    def add_to_stack(self, new_array, output_tile, nodata=None):
+        """Add new array to existing stack."""
+        assert isinstance(new_array, np.ndarray)
+        stack = self.open(output_tile).read()
+        if not isinstance(stack, np.ndarray):
+            stack = self.empty(output_tile)
+        assert isinstance(stack, np.ndarray)
+        if not nodata:
+            nodata = 0
+        if new_array.mask.all():
+            return stack
+        # Create a new stack putting the new slice on top and a second stack
+        # appending an empty slice to the bottom.
+        stack1 = np.concatenate((new_array[np.newaxis, :], stack))
+        stack2 = np.concatenate((
+            stack, np.full(
+                new_array.shape, nodata, dtype=stack.dtype)[np.newaxis, :]))
+        mask_stack = np.stack((
+            new_array.mask
+            for i in range(stack1.shape[0])
+        ))
+        new_stack = np.where(mask_stack, stack2, stack1)
+        masked_stack = ma.masked_where(new_stack == nodata, new_stack)
+        if masked_stack[-1].mask.all():
+            return masked_stack[:-1]
+        else:
+            return masked_stack
+
+    def open(self, output_tile, **kwargs):
+        """Open process output as input for other process."""
+        return InputTile(output_tile, self.get_path(output_tile))
+
+
+class InputTile(base.InputTile):
+    """Target Tile representation of output data."""
+
+    def __init__(self, tile, path):
+        """Initialize."""
+        self.tile = tile
+        self.path = path
+        self._cache = {}
+
+    def read(self):
+        """Read reprojected and resampled numpy array for current Tile."""
+        if "data" not in self._cache:
+            if not os.path.isfile(self.path):
+                self._cache["data"] = None
+            else:
+                data = bp.unpack_ndarray_file(self.path)
+                self._cache["data"] = ma.MaskedArray(
+                    data=data[0], mask=data[1])
+        return self._cache["data"]
+
+    def is_empty(self):
+        """Check if there is data within this tile."""
+        if not os.path.isfile(self.path) or self.read().mask.all():
+            return True
+        else:
+            return False

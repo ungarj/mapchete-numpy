@@ -13,8 +13,8 @@ setup(
     packages=['mapchete_numpy'],
     install_requires=[
         'mapchete>=0.4',
-        'blosc==1.3.2',
-        'bloscpack==0.10.0'
+        'bloscpack>=0.11.0',
+        'blosc>=1.4.4'
         ],
     entry_points={'mapchete.formats.drivers': ['numpy=mapchete_numpy']},
     classifiers=[

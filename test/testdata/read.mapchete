@@ -1,0 +1,16 @@
+# mapchete parameters
+process_file: read.py
+process_minzoom: 0
+process_maxzoom: 5
+input_files:
+    file1: write.mapchete
+
+output:
+    type: geodetic
+    dtype: uint16
+    bands: 1
+    format: GTiff
+    path: tmp/gtiff
+
+pixelbuffer: 10
+metatiling: 8
