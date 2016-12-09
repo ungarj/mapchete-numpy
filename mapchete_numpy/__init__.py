@@ -36,8 +36,10 @@ class OutputData(base.OutputData):
         """Write process output into GeoTIFFs."""
         process_tile.data = process_tile.data[:]
         self.verify_data(process_tile.data)
-        self.prepare_data(process_tile.data)
+        process_tile.data = self.prepare_data(process_tile.data)
         assert isinstance(process_tile.data, ma.MaskedArray)
+        if process_tile.data.mask.all():
+            return
         # Convert from process_tile to output_tiles
         for tile in self.pyramid.intersecting(process_tile):
             # skip if file exists and overwrite is not set
@@ -49,12 +51,17 @@ class OutputData(base.OutputData):
             # write_from_tile(buffered_tile, profile, out_tile, out_path)
             stack = self.add_to_stack(out_data, out_tile)
             if isinstance(stack.mask, np.bool_):
-                if stack.mask is False:
+                if not stack.mask:
                     self.prepare_path(tile)
-                    bp.pack_ndarray_file(np.array([
-                        stack,
-                        np.full(process_tile.data.shape, stack.mask, bool)]),
-                        out_path)
+                    try:
+                        bp.pack_ndarray_file(np.array([
+                            stack,
+                            np.full(
+                                stack.shape, False, bool)
+                            ]),
+                            out_path)
+                    except:
+                        raise
             elif not stack.mask.all():
                 self.prepare_path(tile)
                 bp.pack_ndarray_file(
@@ -119,13 +126,7 @@ class OutputData(base.OutputData):
         Returns a nD masked NumPy array including all bands with the data type
         specified in the configuration.
         """
-        if isinstance(data, np.ndarray):
-            return ma.MaskedArray(
-                data=data.astype(self.output_params["dtype"]),
-                mask=np.where(data == self.nodata, True, False))
-        else:
-            return data
-
+        return ma.masked_where(data == self.nodata, data, copy=True)
 
     def empty(self, process_tile):
         """Empty data."""
@@ -149,7 +150,9 @@ class OutputData(base.OutputData):
         assert isinstance(stack, np.ndarray)
         if not nodata:
             nodata = 0
-        if new_array.mask.all():
+        if isinstance(new_array.mask, np.bool_) and new_array.mask:
+            return stack
+        elif new_array.mask.all():
             return stack
         # Create a new stack putting the new slice on top and a second stack
         # appending an empty slice to the bottom.
@@ -157,12 +160,16 @@ class OutputData(base.OutputData):
         stack2 = np.concatenate((
             stack, np.full(
                 new_array.shape, nodata, dtype=stack.dtype)[np.newaxis, :]))
-        mask_stack = np.stack((
-            new_array.mask
-            for i in range(stack1.shape[0])
-        ))
+        if isinstance(new_array.mask, np.bool_):
+            if not new_array.mask:
+                return stack1
+        mask_stack = np.stack(
+            (new_array.mask for i in range(stack1.shape[0])))
         new_stack = np.where(mask_stack, stack2, stack1)
         masked_stack = ma.masked_where(new_stack == nodata, new_stack)
+        if isinstance(masked_stack.mask, np.bool_):
+            if not masked_stack.mask:
+                return masked_stack
         if masked_stack[-1].mask.all():
             return masked_stack[:-1]
         else:
@@ -188,9 +195,11 @@ class InputTile(base.InputTile):
             if not os.path.isfile(self.path):
                 self._cache["data"] = None
             else:
-                data = bp.unpack_ndarray_file(self.path)
+                combined = bp.unpack_ndarray_file(self.path)
+                data = combined[0]
+                mask = combined[1]
                 self._cache["data"] = ma.MaskedArray(
-                    data=data[0], mask=data[1])
+                    data=data, mask=mask)
         return self._cache["data"]
 
     def is_empty(self):
@@ -199,3 +208,11 @@ class InputTile(base.InputTile):
             return True
         else:
             return False
+
+    def __enter__(self):
+        """Enable context manager."""
+        return self
+
+    def __exit__(self, t, v, tb):
+        """Clear cache on close."""
+        del self._cache
