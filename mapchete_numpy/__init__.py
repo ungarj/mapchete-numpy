@@ -4,6 +4,8 @@ import os
 import numpy as np
 import numpy.ma as ma
 import bloscpack as bp
+import multiprocessing as mp
+from functools import partial
 
 from mapchete.formats import base
 from mapchete.tile import BufferedTile
@@ -32,40 +34,19 @@ class OutputData(base.OutputData):
         except KeyError:
             self.nodata = 0
 
-    def write(self, process_tile, overwrite=False):
+    def write(self, process_tile):
         """Write process output into GeoTIFFs."""
         process_tile.data = process_tile.data[:]
         self.verify_data(process_tile.data)
         process_tile.data = self.prepare_data(process_tile.data)
-        assert isinstance(process_tile.data, ma.MaskedArray)
-        if process_tile.data.mask.all():
+        assert isinstance(process_tile.data, np.ndarray)
+        if np.where(process_tile.data == self.nodata, True, False).all():
             return
-        # Convert from process_tile to output_tiles
         for tile in self.pyramid.intersecting(process_tile):
-            # skip if file exists and overwrite is not set
-            out_path = self.get_path(tile)
-            if os.path.exists(out_path) and not overwrite:
-                return
             out_tile = BufferedTile(tile, self.pixelbuffer)
             out_data = raster.extract_from_tile(process_tile, out_tile)
-            # write_from_tile(buffered_tile, profile, out_tile, out_path)
-            stack = self.add_to_stack(out_data, out_tile)
-            if isinstance(stack.mask, np.bool_):
-                if not stack.mask:
-                    self.prepare_path(tile)
-                    try:
-                        bp.pack_ndarray_file(np.array([
-                            stack,
-                            np.full(
-                                stack.shape, False, bool)
-                            ]),
-                            out_path)
-                    except:
-                        raise
-            elif not stack.mask.all():
-                self.prepare_path(tile)
-                bp.pack_ndarray_file(
-                    np.array([stack, stack.mask]), out_path)
+            p = mp.Process(target=self._write_tile, args=(tile, out_data))
+            p.start()
 
     def tiles_exist(self, process_tile):
         """Check whether all output tiles of a process tile exist."""
@@ -126,7 +107,12 @@ class OutputData(base.OutputData):
         Returns a nD masked NumPy array including all bands with the data type
         specified in the configuration.
         """
-        return ma.masked_where(data == self.nodata, data, copy=True)
+        if isinstance(data, ma.masked_array):
+            masked_data = data
+        elif isinstance(data, np.ndarray):
+            masked_data = ma.masked_where(data == self.nodata, data, copy=True)
+        masked_data.set_fill_value(self.nodata)
+        return masked_data.filled()
 
     def empty(self, process_tile):
         """Empty data."""
@@ -141,70 +127,94 @@ class OutputData(base.OutputData):
             mask=True
         )
 
-    def add_to_stack(self, new_array, output_tile, nodata=None):
+    def add_to_stack(
+        self, new_array, output_tile, nodata=None, close_gaps=False
+    ):
         """Add new array to existing stack."""
         assert isinstance(new_array, np.ndarray)
-        stack = self.open(output_tile).read()
+        stack = self.open(output_tile).read(masked=False)
         if not isinstance(stack, np.ndarray):
             stack = self.empty(output_tile)
         assert isinstance(stack, np.ndarray)
         if not nodata:
             nodata = 0
-        if isinstance(new_array.mask, np.bool_) and new_array.mask:
-            return stack
-        elif new_array.mask.all():
+        if np.where(new_array == nodata, True, False).all():
             return stack
         # Create a new stack putting the new slice on top and a second stack
         # appending an empty slice to the bottom.
         stack1 = np.concatenate((new_array[np.newaxis, :], stack))
-        stack2 = np.concatenate((
-            stack, np.full(
-                new_array.shape, nodata, dtype=stack.dtype)[np.newaxis, :]))
-        if isinstance(new_array.mask, np.bool_):
-            if not new_array.mask:
-                return stack1
-        mask_stack = np.stack(
-            (new_array.mask for i in range(stack1.shape[0])))
-        new_stack = np.where(mask_stack, stack2, stack1)
-        masked_stack = ma.masked_where(new_stack == nodata, new_stack)
-        if isinstance(masked_stack.mask, np.bool_):
-            if not masked_stack.mask:
+        if close_gaps:
+            stack2 = np.concatenate((
+                stack, np.full(
+                    new_array.shape, nodata, dtype=stack.dtype)[np.newaxis, :]))
+            if isinstance(new_array.mask, np.bool_):
+                if not new_array.mask:
+                    return stack1
+            mask_stack = np.stack(
+                (new_array.mask for i in range(stack1.shape[0])))
+            new_stack = np.where(mask_stack, stack2, stack1)
+            masked_stack = ma.masked_where(new_stack == nodata, new_stack)
+            if isinstance(masked_stack.mask, np.bool_):
+                if not masked_stack.mask:
+                    return masked_stack
+            if masked_stack[-1].mask.all():
+                return masked_stack[:-1]
+            else:
                 return masked_stack
-        if masked_stack[-1].mask.all():
-            return masked_stack[:-1]
         else:
-            return masked_stack
+            return stack1
 
-    def open(self, output_tile, **kwargs):
+    def open(self, output_tile, *kwargs):
         """Open process output as input for other process."""
-        return InputTile(output_tile, self.get_path(output_tile))
+        return InputTile(
+            output_tile, self.get_path(output_tile), nodata=self.nodata)
+
+    def _write_tile(self, tile, out_data):
+        if isinstance(out_data, np.ndarray) and (
+            np.where(out_data == self.nodata, True, False).all()
+        ):
+            return
+        out_path = self.get_path(tile)
+        out_tile = BufferedTile(tile, self.pixelbuffer)
+        stack = self.add_to_stack(out_data, out_tile)
+        self.prepare_path(tile)
+        bp.pack_ndarray_file(stack, out_path)
 
 
 class InputTile(base.InputTile):
     """Target Tile representation of output data."""
 
-    def __init__(self, tile, path):
+    def __init__(self, tile, path, nodata=0):
         """Initialize."""
         self.tile = tile
         self.path = path
+        self.nodata = nodata
         self._cache = {}
 
-    def read(self):
+    def read(self, masked=True):
         """Read reprojected and resampled numpy array for current Tile."""
         if "data" not in self._cache:
             if not os.path.isfile(self.path):
                 self._cache["data"] = None
             else:
-                combined = bp.unpack_ndarray_file(self.path)
-                data = combined[0]
-                mask = combined[1]
-                self._cache["data"] = ma.MaskedArray(
-                    data=data, mask=mask)
+                data = bp.unpack_ndarray_file(self.path)
+                if masked:
+                    self._cache["data"] = ma.masked_where(
+                        data == self.nodata, data)
+                else:
+                    self._cache["data"] = data
         return self._cache["data"]
 
     def is_empty(self):
         """Check if there is data within this tile."""
-        if not os.path.isfile(self.path) or self.read().mask.all():
+        if not os.path.isfile(self.path):
+            return True
+        data = self.read()
+        if isinstance(self.read(), ma.masked_array) and data.mask.all():
+            return True
+        elif isinstance(data, np.ndarray) and (
+            np.where(data == self.nodata, True, False).all()
+        ):
             return True
         else:
             return False
