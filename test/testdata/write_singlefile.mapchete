@@ -12,7 +12,6 @@ output:
     format: NumPy
     path: tmp/np
     ndim: 4
-    single_file: False
 
 pixelbuffer: 10
 metatiling: 8

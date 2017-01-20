@@ -5,7 +5,8 @@ import numpy as np
 import numpy.ma as ma
 import bloscpack as bp
 import multiprocessing as mp
-from functools import partial
+import warnings
+from copy import deepcopy
 
 from mapchete.formats import base
 from mapchete.tile import BufferedTile
@@ -33,6 +34,10 @@ class OutputData(base.OutputData):
             self.nodata = output_params["nodata"]
         except KeyError:
             self.nodata = 0
+        try:
+            self.single_file = output_params["single_file"]
+        except KeyError:
+            self.single_file = True
 
     def write(self, process_tile):
         """Write process output into GeoTIFFs."""
@@ -72,16 +77,29 @@ class OutputData(base.OutputData):
         """Determine target file path."""
         zoomdir = os.path.join(self.path, str(tile.zoom))
         rowdir = os.path.join(zoomdir, str(tile.row))
-        return os.path.join(rowdir, str(tile.col) + self.file_extension)
+        if self.single_file:
+            return os.path.join(rowdir, str(tile.col) + self.file_extension)
+        else:
+            return os.path.join(rowdir, str(tile.col))
 
     def prepare_path(self, tile):
         """Create directory and subdirectory if necessary."""
         zoomdir = os.path.join(self.path, str(tile.zoom))
-        if not os.path.exists(zoomdir):
+        try:
             os.makedirs(zoomdir)
+        except:
+            pass
         rowdir = os.path.join(zoomdir, str(tile.row))
-        if not os.path.exists(rowdir):
+        try:
             os.makedirs(rowdir)
+        except:
+            pass
+        coldir = os.path.join(rowdir, str(tile.col))
+        if not self.single_file:
+            try:
+                os.makedirs(coldir)
+            except:
+                pass
 
     def verify_data(self, tile):
         """Verify array data and move array into tuple if necessary."""
@@ -112,7 +130,15 @@ class OutputData(base.OutputData):
         elif isinstance(data, np.ndarray):
             masked_data = ma.masked_where(data == self.nodata, data, copy=True)
         masked_data.set_fill_value(self.nodata)
-        return masked_data.filled()
+        if self.single_file:
+            return masked_data.filled()
+        elif masked_data.ndim == 4 and masked_data.shape[0] == 1:
+            return masked_data.filled()[0]
+        elif masked_data.ndim == 3:
+            return masked_data.filled()
+        else:
+            raise RuntimeError(
+                "write data has invalid dimensions: %s" % masked_data.ndim)
 
     def empty(self, process_tile):
         """Empty data."""
@@ -120,7 +146,7 @@ class OutputData(base.OutputData):
             data=np.array(
                 np.full(
                     (self.output_params["bands"], ) + process_tile.shape,
-                    self.output_params["nodata"],
+                    self.nodata,
                     dtype=self.output_params["dtype"]),
                 ndmin=self.output_params["ndim"]
             ),
@@ -167,7 +193,8 @@ class OutputData(base.OutputData):
     def open(self, output_tile, *kwargs):
         """Open process output as input for other process."""
         return InputTile(
-            output_tile, self.get_path(output_tile), nodata=self.nodata)
+            output_tile, self.get_path(output_tile), nodata=self.nodata,
+            single_file=self.single_file, file_extension=self.file_extension)
 
     def _write_tile(self, tile, out_data):
         if isinstance(out_data, np.ndarray) and (
@@ -175,29 +202,39 @@ class OutputData(base.OutputData):
         ):
             return
         out_path = self.get_path(tile)
-        out_tile = BufferedTile(tile, self.pixelbuffer)
-        stack = self.add_to_stack(out_data, out_tile)
         self.prepare_path(tile)
-        bp.pack_ndarray_file(stack, out_path)
+        out_tile = BufferedTile(tile, self.pixelbuffer)
+        if self.single_file:
+            out_data = self.add_to_stack(out_data, out_tile)
+        else:
+            out_path = os.path.join(
+                out_path, str(len(os.listdir(out_path))) + self.file_extension)
+        bp.pack_ndarray_file(out_data, out_path)
 
 
 class InputTile(base.InputTile):
     """Target Tile representation of output data."""
 
-    def __init__(self, tile, path, nodata=0):
+    def __init__(
+        self, tile, path, nodata=0, single_file=True, file_extension=None
+    ):
         """Initialize."""
         self.tile = tile
         self.path = path
         self.nodata = nodata
+        self.single_file = single_file
+        self.file_extension = file_extension
         self._cache = {}
 
     def read(self, masked=True):
         """Read reprojected and resampled numpy array for current Tile."""
         if "data" not in self._cache:
-            if not os.path.isfile(self.path):
+            if self.single_file and not os.path.isfile(self.path):
+                self._cache["data"] = None
+            elif not self.single_file and not os.path.isdir(self.path):
                 self._cache["data"] = None
             else:
-                data = bp.unpack_ndarray_file(self.path)
+                data = self._read_numpy(self.path)
                 if masked:
                     self._cache["data"] = ma.masked_where(
                         data == self.nodata, data)
@@ -207,8 +244,12 @@ class InputTile(base.InputTile):
 
     def is_empty(self):
         """Check if there is data within this tile."""
-        if not os.path.isfile(self.path):
-            return True
+        if self.single_file:
+            if not os.path.isfile(self.path):
+                return True
+        else:
+            if not os.path.isdir(self.path):
+                return True
         data = self.read()
         if isinstance(self.read(), ma.masked_array) and data.mask.all():
             return True
@@ -218,6 +259,22 @@ class InputTile(base.InputTile):
             return True
         else:
             return False
+
+    def _read_numpy(self, path):
+        """Read from dumped NumPy file or directory of NumPy files."""
+        if os.path.isdir(path):
+            slices = ()
+            for part_path in range(len(os.listdir(path))):
+                single_slice = self._read_numpy(os.path.join(
+                    path, str(part_path) + self.file_extension))
+                if single_slice is not None:
+                    slices += (single_slice, )
+            return np.stack(slices)
+        try:
+            return bp.unpack_ndarray_file(path)
+        except:
+            warnings.warn("blosc could not read NumPy file.")
+            return None
 
     def __enter__(self):
         """Enable context manager."""
