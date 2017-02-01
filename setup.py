@@ -8,7 +8,7 @@ setup(
     description='Mapchete NumPy read/write extension',
     author='Joachim Ungar',
     author_email='joachim.ungar@gmail.com',
-    url='https://github.com/ungarj/mapchete-safe',
+    url='https://github.com/ungarj/mapchete-numpy',
     license='MIT',
     packages=['mapchete_numpy'],
     install_requires=[
