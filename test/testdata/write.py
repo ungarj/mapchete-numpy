@@ -15,7 +15,4 @@ class Process(MapcheteProcess):
         self.abstract="short description on what my process does"
 
     def execute(self):
-        with self.open("file1") as test_file:
-            data = test_file.read()
-            expanded_data = data[np.newaxis, np.newaxis, :]
-        return expanded_data
+        return "empty"
